@@ -101,8 +101,8 @@ define_model_enum! {
         Sonar => { name: "sonar", preference: "experimental" },
         /// GPT-5.4 model.
         Gpt54 => { name: "gpt-5.4", preference: "gpt54" },
-        /// Claude 4.6 Sonnet model.
-        Claude46Sonnet => { name: "claude-4.6-sonnet", preference: "claude46sonnet" },
+        /// Claude Sonnet 5.0 model.
+        Claude50Sonnet => { name: "claude-5.0-sonnet", preference: "claude50sonnet" },
         /// Nemotron 3 Super
         Nemotron3Super => { name: "nemotron-3-super", preference: "nv_nemotron_3_super" },
     }
@@ -116,7 +116,7 @@ define_model_enum! {
         Gemini31Pro => { name: "gemini-3.1-pro", preference: "gemini31pro_high" },
         /// GPT-5.4 with thinking capabilities.
         Gpt54Thinking => { name: "gpt-5.4-thinking", preference: "gpt54_thinking" },
-        /// Claude 4.6 Sonnet with thinking capabilities.
-        Claude46SonnetThinking => { name: "claude-4.6-sonnet-thinking", preference: "claude46sonnetthinking" },
+        /// Claude Sonnet 5.0 with thinking enabled.
+        Claude50SonnetThinking => { name: "claude-5.0-sonnet-thinking", preference: "claude50sonnetthinking" },
     }
 }

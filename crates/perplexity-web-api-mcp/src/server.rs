@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use perplexity_web_api::{
-    Client, ModelPreference, ReasonModel, SearchMode, SearchModel, SearchRequest,
-    SearchWebResult, Source, UploadFile,
+    Client, FollowUpContext, ModelPreference, ReasonModel, SearchMode, SearchModel,
+    SearchRequest, SearchResponse, SearchWebResult, Source, UploadFile,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -43,6 +43,10 @@ pub struct PerplexitySearchRequest {
     /// Language code (ISO 639), e.g., "en-US". Defaults to "en-US".
     #[serde(default)]
     pub language: Option<String>,
+
+    /// Backend UUID from a previous response, to continue that thread.
+    #[serde(default)]
+    pub follow_up_backend_uuid: Option<String>,
 }
 
 /// Request parameters for AI-powered tools that support file attachments.
@@ -65,11 +69,21 @@ pub struct PerplexityRequest {
     /// Each entry needs `filename` and either `text` (plain text) or `data` (base64 binary).
     #[serde(default)]
     pub files: Option<Vec<FileAttachment>>,
+
+    /// Backend UUID from a previous response, to continue that thread.
+    #[serde(default)]
+    pub follow_up_backend_uuid: Option<String>,
 }
 
 impl From<PerplexitySearchRequest> for PerplexityRequest {
     fn from(r: PerplexitySearchRequest) -> Self {
-        Self { query: r.query, sources: r.sources, language: r.language, files: None }
+        Self {
+            query: r.query,
+            sources: r.sources,
+            language: r.language,
+            files: None,
+            follow_up_backend_uuid: r.follow_up_backend_uuid,
+        }
     }
 }
 
@@ -101,6 +115,18 @@ pub struct FollowUpInfo {
 pub struct SearchOnlyResponse {
     /// Web search results with titles, URLs, and snippets.
     pub web_results: Vec<SearchWebResult>,
+}
+
+/// A generated image returned without exposing Perplexity's signed media URL.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GeneratedImageResponse {
+    pub answer: Option<String>,
+    pub filename: String,
+    pub mime_type: String,
+    pub data: String,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub backend_uuid: Option<String>,
 }
 
 /// MCP server wrapping Perplexity AI client.
@@ -177,13 +203,13 @@ impl PerplexityServer {
     ///
     /// When `files_allowed` is `false`, the method rejects any request that
     /// contains file attachments with a clear error before doing anything else.
-    async fn do_search(
+    async fn execute_search(
         &self,
         params: PerplexityRequest,
         mode: SearchMode,
         model_preference: Option<ModelPreference>,
         files_allowed: bool,
-    ) -> Result<PerplexityResponse, McpError> {
+    ) -> Result<SearchResponse, McpError> {
         let files: Vec<UploadFile> = if let Some(attachments) = params.files {
             if !attachments.is_empty() {
                 if !files_allowed {
@@ -248,9 +274,27 @@ impl PerplexityServer {
             request = request.language(language);
         }
 
-        let response = self.client.search(request).await.map_err(|e| {
+        if let Some(uuid) = params.follow_up_backend_uuid {
+            request = request.follow_up(FollowUpContext {
+                backend_uuid: Some(uuid),
+                attachments: Vec::new(),
+            });
+        }
+
+        self.client.search(request).await.map_err(|e| {
             McpError::internal_error(format!("Perplexity API error: {}", e), None)
-        })?;
+        })
+    }
+
+    async fn do_search(
+        &self,
+        params: PerplexityRequest,
+        mode: SearchMode,
+        model_preference: Option<ModelPreference>,
+        files_allowed: bool,
+    ) -> Result<PerplexityResponse, McpError> {
+        let response =
+            self.execute_search(params, mode, model_preference, files_allowed).await?;
         let perplexity_web_api::SearchResponse { answer, web_results, follow_up, .. } =
             response;
 
@@ -263,6 +307,52 @@ impl PerplexityServer {
             },
         })
     }
+
+    fn generated_image_metadata(
+        raw: &serde_json::Value,
+    ) -> Result<(String, String, Option<u64>, Option<u64>), McpError> {
+        let media = raw
+            .get("media_items")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("medium").and_then(serde_json::Value::as_str) == Some("image")
+                        && item.get("generated_media_metadata").is_some()
+                })
+            })
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Perplexity completed without a generated image asset".to_string(),
+                    None,
+                )
+            })?;
+        let url = media.get("image").and_then(serde_json::Value::as_str).ok_or_else(|| {
+            McpError::internal_error(
+                "Perplexity generated image metadata without an image URL".to_string(),
+                None,
+            )
+        })?;
+        let name = media
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("perplexity-generated-image");
+        let filename = format!("{}.png", sanitize_filename(name));
+        Ok((
+            url.to_string(),
+            filename,
+            media.get("image_width").and_then(serde_json::Value::as_u64),
+            media.get("image_height").and_then(serde_json::Value::as_u64),
+        ))
+    }
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let clean: String = value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let clean = clean.trim_matches('-');
+    if clean.is_empty() { "perplexity-generated-image".to_string() } else { clean.to_string() }
 }
 
 #[tool_router]
@@ -325,6 +415,68 @@ impl PerplexityServer {
             )
             .await?;
         to_json_tool_result(&response)
+    }
+
+    /// Generate an image with Perplexity and return its bytes without exposing signed URLs.
+    #[tool(
+        name = "perplexity_generate_image",
+        description = "Generate an original image with Perplexity. Returns the generated PNG as base64 plus dimensions and thread metadata. Requires authenticated Perplexity session tokens.",
+        annotations(
+            title = "Generate Image",
+            read_only_hint = false,
+            open_world_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    pub async fn perplexity_generate_image(
+        &self,
+        Parameters(params): Parameters<PerplexityRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.tokenless {
+            return Err(McpError::invalid_params(
+                "Image generation requires authenticated Perplexity session tokens.",
+                None,
+            ));
+        }
+        let response = self
+            .execute_search(
+                params,
+                SearchMode::Pro,
+                self.ask_model.map(ModelPreference::from),
+                false,
+            )
+            .await?;
+        let (url, filename, width, height) = Self::generated_image_metadata(&response.raw)?;
+        let image = rquest::Client::builder()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("image client error: {e}"), None))?
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| McpError::internal_error(format!("image download error: {e}"), None))?
+            .error_for_status()
+            .map_err(|e| {
+                McpError::internal_error(format!("image download status error: {e}"), None)
+            })?
+            .bytes()
+            .await
+            .map_err(|e| McpError::internal_error(format!("image body error: {e}"), None))?;
+        if image.len() > 20 * 1024 * 1024 {
+            return Err(McpError::internal_error(
+                "generated image exceeds the 20 MiB response limit".to_string(),
+                None,
+            ));
+        }
+        to_json_tool_result(&GeneratedImageResponse {
+            answer: response.answer,
+            filename,
+            mime_type: "image/png".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(image),
+            width,
+            height,
+            backend_uuid: response.follow_up.backend_uuid,
+        })
     }
 
     /// Deep, comprehensive research using Perplexity's sonar-deep-research model.
@@ -418,5 +570,41 @@ impl ServerHandler for PerplexityServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(instructions)
             .with_server_info(server_info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_image_metadata_selects_generated_media_without_exposing_it() {
+        let raw = serde_json::json!({
+            "media_items": [
+                {"medium": "image", "image": "https://example.invalid/reference.png"},
+                {
+                    "medium": "image",
+                    "name": "Green teapot / white background",
+                    "image": "https://signed.example.invalid/generated.png?Signature=secret",
+                    "image_width": 1254,
+                    "image_height": 1254,
+                    "generated_media_metadata": {"model_str": "gpt-4o-image"}
+                }
+            ]
+        });
+        let (url, filename, width, height) =
+            PerplexityServer::generated_image_metadata(&raw).unwrap();
+        assert_eq!(url, "https://signed.example.invalid/generated.png?Signature=secret");
+        assert_eq!(filename, "Green-teapot---white-background.png");
+        assert_eq!(width, Some(1254));
+        assert_eq!(height, Some(1254));
+    }
+
+    #[test]
+    fn generated_image_metadata_rejects_non_generated_images() {
+        let raw = serde_json::json!({
+            "media_items": [{"medium": "image", "image": "https://example.invalid/reference.png"}]
+        });
+        assert!(PerplexityServer::generated_image_metadata(&raw).is_err());
     }
 }

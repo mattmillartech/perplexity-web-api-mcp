@@ -249,7 +249,8 @@ impl Client {
     /// `turboclaw-w4THK6UCQhGvch04UnKrng` from
     /// `https://www.perplexity.ai/spaces/turboclaw-w4THK6UCQhGvch04UnKrng`.
     pub async fn get_collection_uuid(&self, slug: &str) -> Result<String> {
-        let url = format!("{}{}?collection_slug={}", API_BASE_URL, ENDPOINT_COLLECTION_GET, slug);
+        let url =
+            format!("{}{}?collection_slug={}", API_BASE_URL, ENDPOINT_COLLECTION_GET, slug);
         let resp_fut = self.http.get(&url).send();
         let resp = tokio::time::timeout(self.timeout, resp_fut)
             .await
@@ -260,14 +261,16 @@ impl Client {
                 status: e.status().map(|s| s.as_u16()).unwrap_or(0),
                 message: format!("Collection lookup failed: {}", e),
             })?;
-        let json: serde_json::Value = resp.json().await.map_err(|e| Error::SearchRequest(e))?;
-        json.get("uuid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-            .ok_or_else(|| Error::Server {
+        let json: serde_json::Value = resp.json().await.map_err(Error::SearchRequest)?;
+        json.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_owned()).ok_or_else(|| {
+            Error::Server {
                 status: 0,
-                message: format!("Collection response missing 'uuid' field for slug '{}'", slug),
-            })
+                message: format!(
+                    "Collection response missing 'uuid' field for slug '{}'",
+                    slug
+                ),
+            }
+        })
     }
 
     fn validate_request(&self, request: &SearchRequest) -> Result<()> {

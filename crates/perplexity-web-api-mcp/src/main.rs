@@ -176,7 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(uuid)
             }
             Err(e) => {
-                tracing::error!("Failed to resolve Space slug '{}': {}. Searches will not be scoped to any Space.", slug, e);
+                tracing::error!(
+                    "Failed to resolve Space slug '{}': {}. Searches will not be scoped to any Space.",
+                    slug,
+                    e
+                );
                 None
             }
         }

@@ -1224,6 +1224,7 @@ dependencies = [
  "base64",
  "perplexity-web-api",
  "rmcp",
+ "rquest",
  "serde",
  "serde_json",
  "tokio",
