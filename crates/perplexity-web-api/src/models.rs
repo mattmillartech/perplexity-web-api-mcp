@@ -101,10 +101,26 @@ define_model_enum! {
         Sonar => { name: "sonar", preference: "experimental" },
         /// GPT-5.4 model.
         Gpt54 => { name: "gpt-5.4", preference: "gpt54" },
+        /// GPT-5.6 Terra model.
+        Gpt56Terra => { name: "gpt-5.6-terra", preference: "gpt56_terra" },
         /// Claude Sonnet 5.0 model.
         Claude50Sonnet => { name: "claude-5.0-sonnet", preference: "claude50sonnet" },
         /// Nemotron 3 Super
         Nemotron3Super => { name: "nemotron-3-super", preference: "nv_nemotron_3_super" },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReasonModel, SearchModel};
+
+    #[test]
+    fn gpt_56_terra_uses_the_live_perplexity_preference() {
+        let search: SearchModel = "gpt-5.6-terra".parse().expect("search model");
+        let reason: ReasonModel = "gpt-5.6-terra-thinking".parse().expect("reason model");
+
+        assert_eq!(search.api_preference().as_str(), "gpt56_terra");
+        assert_eq!(reason.api_preference().as_str(), "gpt56_terra");
     }
 }
 
@@ -116,6 +132,8 @@ define_model_enum! {
         Gemini31Pro => { name: "gemini-3.1-pro", preference: "gemini31pro_high" },
         /// GPT-5.4 with thinking capabilities.
         Gpt54Thinking => { name: "gpt-5.4-thinking", preference: "gpt54_thinking" },
+        /// GPT-5.6 Terra with thinking capabilities.
+        Gpt56TerraThinking => { name: "gpt-5.6-terra-thinking", preference: "gpt56_terra" },
         /// Claude Sonnet 5.0 with thinking enabled.
         Claude50SonnetThinking => { name: "claude-5.0-sonnet-thinking", preference: "claude50sonnetthinking" },
     }
