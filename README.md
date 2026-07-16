@@ -67,12 +67,14 @@ This server requires a Perplexity AI account. You need to extract two authentica
     - `pro-auto` (default for authenticated)
     - `sonar`
     - `gpt-5.4`
+    - `gpt-5.6-terra`
     - `claude-4.6-sonnet`
     - `nemotron-3-super`
 - `PERPLEXITY_REASON_MODEL` (optional, requires tokens): Model for `perplexity_reason`.
   Valid values:
     - `gemini-3.1-pro` (default)
     - `gpt-5.4-thinking`
+    - `gpt-5.6-terra-thinking`
     - `claude-4.6-sonnet-thinking`
 - `PERPLEXITY_INCOGNITO` (optional, default: `true`): Whether requests should use Perplexity's incognito mode.
   Valid values: `true` or `false`

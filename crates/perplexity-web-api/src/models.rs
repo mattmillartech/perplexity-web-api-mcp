@@ -120,7 +120,7 @@ mod tests {
         let reason: ReasonModel = "gpt-5.6-terra-thinking".parse().expect("reason model");
 
         assert_eq!(search.api_preference().as_str(), "gpt56_terra");
-        assert_eq!(reason.api_preference().as_str(), "gpt56_terra");
+        assert_eq!(reason.api_preference().as_str(), "gpt56_terra_thinking");
     }
 }
 
@@ -133,7 +133,7 @@ define_model_enum! {
         /// GPT-5.4 with thinking capabilities.
         Gpt54Thinking => { name: "gpt-5.4-thinking", preference: "gpt54_thinking" },
         /// GPT-5.6 Terra with thinking capabilities.
-        Gpt56TerraThinking => { name: "gpt-5.6-terra-thinking", preference: "gpt56_terra" },
+        Gpt56TerraThinking => { name: "gpt-5.6-terra-thinking", preference: "gpt56_terra_thinking" },
         /// Claude Sonnet 5.0 with thinking enabled.
         Claude50SonnetThinking => { name: "claude-5.0-sonnet-thinking", preference: "claude50sonnetthinking" },
     }
