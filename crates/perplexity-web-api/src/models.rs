@@ -103,6 +103,26 @@ macro_rules! define_model_enum {
 //   4. Add the same name to ASK_MODELS/REASON_MODELS in vault's skills/perplexity/perplexity.py,
 //      then run `python3 skills/perplexity/verify_live_models.py` (real end-to-end call against
 //      the live account) to prove step 3's distinction actually holds for the new model.
+//
+// CHEAPEST WAY TO DO STEP 1 (found 2026-08-12; costs NO query quota, needs no CDP capture):
+//   The web picker writes the exact wire value straight into localStorage on selection --
+//       pplx:account:<uuid>:pplx.local-user-settings.preferredSearchModels-v1
+//         -> {"search":"<the preference string>"}
+//   So: open the model picker, click a model, read that key. No query is sent, so no
+//   advanced-model quota is consumed (the account hit "No more advanced AI model uses
+//   remaining this week" during this work -- quota is a real, small budget).
+//   THE THINKING TOGGLE IS THE TRAP. Each thinking-capable row has aria-haspopup="menu" and a
+//   SUBMENU containing `menuitemcheckbox "Thinking"` + a switch; the stored preference CHANGES
+//   when it is flipped. The picker also renders the toggle state INTO the label, so the same
+//   model appears as "Kimi K3" or "Kimi K3 New Thinking" depending on the switch. A label->id
+//   pair captured without recording the switch state is one sample of a two-valued function,
+//   not a mapping -- that mistake produced a wrong table once already.
+//   DO NOT read `...local-user-settings.modelOptionPreferences` for the wire value: its KEY is a
+//   family id and its VALUE is the toggle, and the two go inconsistent (it held
+//   `grok45low:"reasoning"` while the live preference was `grok45medium`).
+//   Reaching the submenu: only Max-gated rows get accessibility refs, so click `menuitemradio`
+//   rows by text, then ArrowDown to the CHECKED row (compute its index from the DOM -- fixed
+//   counts drift and silently hand you a DIFFERENT model's id) and press ArrowRight.
 define_model_enum! {
     /// Model selection for `perplexity_search`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +142,25 @@ define_model_enum! {
         Claude50Sonnet => { name: "claude-5.0-sonnet", preference: "claude50sonnet" },
         /// Nemotron 3 Super
         Nemotron3Super => { name: "nemotron-3-super", preference: "nv_nemotron_3_super" },
+        /// Grok 4.5, thinking OFF. Preference CAPTURED LIVE 2026-08-12 (see the capture note
+        /// above): selecting Grok 4.5 with its Thinking switch off wrote `grok45low`, and
+        /// flipping the switch changed it to `grok45medium`. NOTE THE SUFFIX IS AN EFFORT
+        /// LEVEL, NOT A `_thinking` SUFFIX -- and the ON value is `medium`, NOT `high`, so it
+        /// does not follow Gemini's `gemini31pro_high` pattern either. Do not "regularise"
+        /// these two strings; they were measured, not derived.
+        Grok45 => { name: "grok-4.5", preference: "grok45low" },
+        /// Kimi K3, thinking OFF.
+        ///
+        /// *** THIS PREFERENCE STRING IS NOT VERIFIED. *** Every other entry in this file was
+        /// observed on the wire or in the picker's own stored preference; this one was NOT. The
+        /// Thinking switch for Kimi K3 read `aria-checked=true` and would not flip in two
+        /// attempts, so a non-thinking Kimi id was never observed and may not even exist.
+        /// `kimik3` is an operator-sanctioned ASSUMPTION (2026-08-12: "Let's assume that kimi
+        /// non-thinking is kimik3"), recorded here explicitly rather than passed off as a
+        /// capture, because step 1 above says never guess a preference string.
+        /// BEFORE RELYING ON THIS: run the live check in step 4. If Perplexity rejects it,
+        /// the fix is to capture the real value, not to widen the parser.
+        KimiK3 => { name: "kimi-k3", preference: "kimik3" },
     }
 }
 
@@ -155,6 +194,49 @@ mod tests {
         let reason: ReasonModel = "claude-5.0-sonnet-thinking".parse().expect("reason model");
         assert_ne!(ask.api_preference().as_str(), reason.api_preference().as_str());
     }
+
+    #[test]
+    fn grok_45_uses_the_captured_effort_level_preferences() {
+        // CAPTURED LIVE 2026-08-12 from the picker's stored preference, both switch states.
+        // Pinned as exact literals because they are NOT derivable: the thinking value is an
+        // effort level (`medium`), not a `_thinking` suffix, and it is not `high` either -- so
+        // neither the Terra/Sonnet convention nor Gemini's `_high` predicts it. If someone
+        // "tidies" these into a pattern, this test is what catches it.
+        let search: SearchModel = "grok-4.5".parse().expect("search model");
+        let reason: ReasonModel = "grok-4.5-thinking".parse().expect("reason model");
+
+        assert_eq!(search.api_preference().as_str(), "grok45low");
+        assert_eq!(reason.api_preference().as_str(), "grok45medium");
+        assert_ne!(
+            search.api_preference().as_str(),
+            reason.api_preference().as_str(),
+            "thinking must be its own wire value, not a same-model toggle"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_thinking_is_the_captured_value_and_differs_from_the_assumed_base() {
+        // `kimik3thinking` WAS observed live. `kimik3` was NOT -- it is an operator-sanctioned
+        // assumption (see the doc comment on SearchModel::KimiK3). This test therefore asserts
+        // exactly what is known: the captured thinking value, and that the two entries are
+        // distinct. It deliberately does NOT claim the base value is correct, because no
+        // observation supports that and a passing unit test must not manufacture confidence.
+        let reason: ReasonModel = "kimi-k3-thinking".parse().expect("reason model");
+        assert_eq!(reason.api_preference().as_str(), "kimik3thinking");
+
+        let search: SearchModel = "kimi-k3".parse().expect("search model");
+        assert_ne!(search.api_preference().as_str(), reason.api_preference().as_str());
+    }
+
+    #[test]
+    fn unknown_model_names_are_rejected_with_the_valid_set() {
+        // The parser must refuse an unrecognised name rather than pass it through to the wire;
+        // a bad preference string fails at call time, which is the failure mode this file's
+        // header warns about.
+        let err = "grok-4.5-medium".parse::<SearchModel>().unwrap_err();
+        assert!(err.contains("unknown model"), "unexpected error: {err}");
+        assert!(err.contains("grok-4.5"), "error should list the valid set: {err}");
+    }
 }
 
 define_model_enum! {
@@ -171,5 +253,15 @@ define_model_enum! {
         /// Claude Sonnet 5.0 with thinking enabled. Live end-to-end verified 2026-07-16, same
         /// basis as Terra Thinking.
         Claude50SonnetThinking => { name: "claude-5.0-sonnet-thinking", preference: "claude50sonnetthinking" },
+        /// Grok 4.5 with thinking enabled. Preference CAPTURED LIVE 2026-08-12 by flipping the
+        /// Thinking switch and re-reading the picker's stored preference: `grok45low` ->
+        /// `grok45medium`. This is a DIFFERENT wire value from the non-thinking entry, which is
+        /// the invariant this file already documents for Terra and Sonnet.
+        Grok45Thinking => { name: "grok-4.5-thinking", preference: "grok45medium" },
+        /// Kimi K3 with thinking enabled. Preference CAPTURED LIVE 2026-08-12 -- this one WAS
+        /// observed (the picker stored `kimik3thinking` while the row rendered "Kimi K3 New
+        /// Thinking" with its switch on). Contrast the non-thinking `KimiK3` entry above, whose
+        /// value is an unverified assumption.
+        KimiK3Thinking => { name: "kimi-k3-thinking", preference: "kimik3thinking" },
     }
 }
