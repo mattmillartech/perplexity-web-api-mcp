@@ -26,6 +26,33 @@ struct FinalAnswerData {
     web_results: Vec<SearchWebResult>,
 }
 
+/// An entry of the CURRENT Perplexity response "blocks" array.
+///
+/// Perplexity replaced the legacy `text` steps array with `blocks`. MEASURED
+/// 2026-08-12 against a live signed-in browser request to
+/// `/rest/sse/perplexity_ask`: the terminal message carries `status:"COMPLETED"`
+/// and NO top-level `text` or `answer` key at all — the answer lives at
+/// `blocks[].markdown_block.answer` (alongside `chunks`, `progress`,
+/// `chunk_starting_offset`), with `intended_usage:"ask_text"`. Because both
+/// legacy extraction paths key off fields that no longer exist, every call
+/// returned `answer: null` even though the thread was created and answered
+/// server-side (verified by opening the returned backend_uuid in the browser).
+#[derive(Deserialize)]
+struct ResponseBlock {
+    #[serde(default)]
+    markdown_block: Option<MarkdownBlock>,
+}
+
+/// The markdown answer block of a `blocks` entry.
+#[derive(Deserialize)]
+struct MarkdownBlock {
+    answer: Option<String>,
+    /// Not present on the ask_text block measured above; kept so a block type
+    /// that does carry sources still surfaces them rather than being dropped.
+    #[serde(default)]
+    web_results: Vec<SearchWebResult>,
+}
+
 /// Parses an SSE event JSON string into a SearchEvent.
 pub(crate) fn parse_sse_event(json_str: &str) -> Result<SearchEvent> {
     let mut content: Map<String, Value> =
@@ -56,15 +83,44 @@ fn expand_text_field(content: &mut Map<String, Value>) {
 
 /// Extracts answer and web_results from the event content.
 ///
-/// Tries the FINAL step inside the "text" steps array first, then falls back
-/// to the top-level "answer" field (which carries no web_results).
+/// Tries the CURRENT `blocks` shape first, then the legacy FINAL step inside
+/// the "text" steps array, then the legacy top-level "answer" field. The legacy
+/// paths are retained rather than replaced: they cost one failed lookup each on
+/// the current shape, and keeping them means a thread or account still served
+/// the old schema does not silently regress to a null answer.
 fn extract_answer_and_web_results(
     content: &Map<String, Value>,
 ) -> (Option<String>, Vec<SearchWebResult>) {
+    if let Some(result) = extract_from_blocks(content) {
+        return result;
+    }
     if let Some(result) = extract_from_final_step(content) {
         return result;
     }
     (extract_string(content, "answer"), Vec::new())
+}
+
+/// Pulls answer + web_results from the current `blocks` array.
+///
+/// Returns the first block carrying a NON-EMPTY answer. Intermediate streamed
+/// messages arrive with the same shape while still filling in, so an empty
+/// string must not be treated as the final answer — otherwise a partial frame
+/// would win over the completed one.
+fn extract_from_blocks(
+    content: &Map<String, Value>,
+) -> Option<(Option<String>, Vec<SearchWebResult>)> {
+    let blocks_value = content.get("blocks")?;
+    let blocks: Vec<ResponseBlock> = serde_json::from_value(blocks_value.clone()).ok()?;
+    for block in blocks {
+        let markdown = match block.markdown_block {
+            Some(markdown) => markdown,
+            None => continue,
+        };
+        if markdown.answer.as_deref().is_some_and(|a| !a.is_empty()) {
+            return Some((markdown.answer, markdown.web_results));
+        }
+    }
+    None
 }
 
 /// Deserializes the "text" steps array and pulls answer + web_results from the
@@ -110,6 +166,44 @@ mod tests {
         assert!(event.web_results.is_empty());
         assert!(event.backend_uuid.is_none());
         assert!(event.attachments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_current_blocks_shape() {
+        // VERBATIM SHAPE captured 2026-08-12 from a live signed-in browser POST to
+        // /rest/sse/perplexity_ask. Note there is NO top-level "text" and NO top-level
+        // "answer" — both legacy paths miss, which is exactly why every call returned
+        // answer:null while Perplexity had in fact answered the thread.
+        let json = r#"{"status":"COMPLETED","backend_uuid":"1c55f722","blocks":[
+            {"intended_usage":"ask_text","markdown_block":{"progress":"DONE","chunks":["PONG"],
+             "chunk_starting_offset":0,"answer":"PONG"}}]}"#;
+        let event = parse_sse_event(json).unwrap();
+
+        assert_eq!(event.answer, Some("PONG".to_string()));
+        assert_eq!(event.backend_uuid, Some("1c55f722".to_string()));
+    }
+
+    #[test]
+    fn test_partial_block_does_not_win_over_completed_answer() {
+        // Streamed frames arrive with the same shape while still filling in. An empty
+        // answer must not be accepted, or a partial frame beats the completed one.
+        let json = r#"{"blocks":[
+            {"intended_usage":"ask_text","markdown_block":{"progress":"IN_PROGRESS","answer":""}},
+            {"intended_usage":"ask_text","markdown_block":{"progress":"DONE","answer":"Real answer"}}]}"#;
+        let event = parse_sse_event(json).unwrap();
+
+        assert_eq!(event.answer, Some("Real answer".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_shapes_still_parse() {
+        // The legacy paths are retained, not replaced: a thread still served the old
+        // schema must not regress to a null answer.
+        let legacy = r#"{"answer": "Legacy top-level"}"#;
+        assert_eq!(
+            parse_sse_event(legacy).unwrap().answer,
+            Some("Legacy top-level".to_string())
+        );
     }
 
     #[test]
