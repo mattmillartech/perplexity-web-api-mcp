@@ -56,15 +56,84 @@ fn expand_text_field(content: &mut Map<String, Value>) {
 
 /// Extracts answer and web_results from the event content.
 ///
-/// Tries the FINAL step inside the "text" steps array first, then falls back
-/// to the top-level "answer" field (which carries no web_results).
+/// Tries the current live wire shape first (a top-level "blocks" array; see
+/// `extract_from_blocks`), then the older "text" steps array (see
+/// `extract_from_final_step`, kept for backward compatibility with any
+/// endpoint that still emits it), then falls back to a bare top-level
+/// "answer" field (which carries no web_results).
 fn extract_answer_and_web_results(
     content: &Map<String, Value>,
 ) -> (Option<String>, Vec<SearchWebResult>) {
+    if let Some(result) = extract_from_blocks(content) {
+        return result;
+    }
     if let Some(result) = extract_from_final_step(content) {
         return result;
     }
     (extract_string(content, "answer"), Vec::new())
+}
+
+/// Extracts answer and web_results from the live Perplexity wire format: a
+/// top-level "blocks" array where each entry carries `intended_usage`, and
+/// either `markdown_block.answer` (for `intended_usage == "ask_text"`, only
+/// present once that block's `progress` reaches "DONE") or
+/// `web_result_block.web_results` (for `intended_usage == "web_results"`).
+///
+/// VERIFIED LIVE 2026-09-16 (gap 2764) against the real Perplexity backend via
+/// a standalone diagnostic capture: the SSE final event no longer contains any
+/// "text" field at all, so `extract_from_final_step` always returned `None`
+/// and every production `ask`/`search` response silently lost its citations
+/// via the old top-level-"answer"-with-empty-Vec fallback -- even though the
+/// answer text itself often contained inline citation markers like `[1][2]`
+/// referencing a source list Perplexity was sending in this very `blocks`
+/// array the whole time.
+///
+/// Returns `None` when the event has no "blocks" array or none of its entries
+/// carry usable answer/web_results content, so callers can fall through to
+/// the older extraction paths.
+fn extract_from_blocks(
+    content: &Map<String, Value>,
+) -> Option<(Option<String>, Vec<SearchWebResult>)> {
+    let blocks = content.get("blocks")?.as_array()?;
+
+    let mut answer: Option<String> = None;
+    let mut web_results: Vec<SearchWebResult> = Vec::new();
+    let mut found_any = false;
+
+    for block in blocks {
+        match block.get("intended_usage").and_then(|v| v.as_str()) {
+            Some("ask_text") => {
+                if let Some(a) = block
+                    .get("markdown_block")
+                    .and_then(|m| m.get("answer"))
+                    .and_then(|v| v.as_str())
+                {
+                    answer = Some(a.to_owned());
+                    found_any = true;
+                }
+            }
+            Some("web_results") => {
+                if let Some(results) = block
+                    .get("web_result_block")
+                    .and_then(|w| w.get("web_results"))
+                {
+                    if let Ok(parsed) =
+                        serde_json::from_value::<Vec<SearchWebResult>>(results.clone())
+                    {
+                        web_results = parsed;
+                        found_any = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if found_any {
+        Some((answer, web_results))
+    } else {
+        None
+    }
 }
 
 /// Deserializes the "text" steps array and pulls answer + web_results from the
@@ -220,5 +289,76 @@ mod tests {
     fn test_parse_invalid_json() {
         let result = parse_sse_event("not json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_event_live_blocks_shape_with_web_results() {
+        // Trimmed real shape captured live 2026-09-16 (gap 2764) from the actual
+        // Perplexity backend -- the current final SSE event has NO "text" field
+        // at all; answer and citations arrive as separate entries in a
+        // top-level "blocks" array instead.
+        let json = serde_json::json!({
+            "status": "COMPLETED",
+            "final": true,
+            "final_sse_message": true,
+            "blocks": [
+                {
+                    "intended_usage": "ask_text",
+                    "markdown_block": {
+                        "progress": "DONE",
+                        "answer": "Josh Morgan is the mayor of London, Ontario."
+                    }
+                },
+                {
+                    "intended_usage": "web_results",
+                    "web_result_block": {
+                        "progress": "DONE",
+                        "web_results": [
+                            {
+                                "name": "Mayor Josh Morgan - City of London",
+                                "url": "https://london.ca/government/mayor-josh-morgan",
+                                "snippet": "Mayor Josh Morgan took office in 2022.",
+                                "timestamp": "2022-10-24T00:00:00",
+                                "meta_data": {"citation_domain_name": "london", "client": "web", "images": []},
+                                "trust": {"level": 3, "name": "trusted", "description": "government", "type_of_trust": "government"}
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let event = parse_sse_event(&json.to_string()).unwrap();
+
+        assert_eq!(event.answer, Some("Josh Morgan is the mayor of London, Ontario.".to_string()));
+        assert_eq!(event.web_results.len(), 1);
+        assert_eq!(event.web_results[0].name, "Mayor Josh Morgan - City of London");
+        assert_eq!(event.web_results[0].url, "https://london.ca/government/mayor-josh-morgan");
+        assert_eq!(event.web_results[0].snippet, "Mayor Josh Morgan took office in 2022.");
+    }
+
+    #[test]
+    fn test_parse_event_live_blocks_shape_intermediate_streaming_chunk() {
+        // An in-progress streaming chunk: an "ask_text" block with partial
+        // "chunks" but no "answer" yet, and no "web_results" block at all.
+        // Must not panic or fabricate content -- both fields stay empty.
+        let json = serde_json::json!({
+            "status": "PENDING",
+            "blocks": [
+                {
+                    "intended_usage": "ask_text",
+                    "markdown_block": {
+                        "progress": "IN_PROGRESS",
+                        "chunks": ["Jo"],
+                        "chunk_starting_offset": 0
+                    }
+                }
+            ]
+        });
+
+        let event = parse_sse_event(&json.to_string()).unwrap();
+
+        assert!(event.answer.is_none());
+        assert!(event.web_results.is_empty());
     }
 }
