@@ -37,18 +37,31 @@ struct FinalAnswerData {
 /// legacy extraction paths key off fields that no longer exist, every call
 /// returned `answer: null` even though the thread was created and answered
 /// server-side (verified by opening the returned backend_uuid in the browser).
+///
+/// CORRECTED 2026-09-16 (gap 2764, live standalone diagnostic capture against
+/// the real backend): citations do NOT live inside `markdown_block` -- that
+/// was an unverified assumption in the original 2026-08-12 fix, and it left
+/// `web_results` permanently empty even after this fix landed. They arrive in
+/// a SEPARATE entry of the same `blocks` array, with `intended_usage:
+/// "web_results"` and the real list at `web_result_block.web_results`.
 #[derive(Deserialize)]
 struct ResponseBlock {
     #[serde(default)]
     markdown_block: Option<MarkdownBlock>,
+    #[serde(default)]
+    web_result_block: Option<WebResultBlock>,
 }
 
-/// The markdown answer block of a `blocks` entry.
+/// The markdown answer block of a `blocks` entry (`intended_usage: "ask_text"`).
 #[derive(Deserialize)]
 struct MarkdownBlock {
     answer: Option<String>,
-    /// Not present on the ask_text block measured above; kept so a block type
-    /// that does carry sources still surfaces them rather than being dropped.
+}
+
+/// The citation-list block of a `blocks` entry (`intended_usage: "web_results"`).
+/// VERIFIED LIVE 2026-09-16 against the real backend -- see gap 2764.
+#[derive(Deserialize)]
+struct WebResultBlock {
     #[serde(default)]
     web_results: Vec<SearchWebResult>,
 }
@@ -102,25 +115,48 @@ fn extract_answer_and_web_results(
 
 /// Pulls answer + web_results from the current `blocks` array.
 ///
-/// Returns the first block carrying a NON-EMPTY answer. Intermediate streamed
-/// messages arrive with the same shape while still filling in, so an empty
-/// string must not be treated as the final answer — otherwise a partial frame
-/// would win over the completed one.
+/// Answer and citations arrive as SEPARATE entries in the same array (one
+/// `intended_usage: "ask_text"`, one `intended_usage: "web_results"`), so
+/// both must be scanned for independently -- finding one is not a signal to
+/// stop looking for the other. The first non-empty answer wins: intermediate
+/// streamed messages carry the same `markdown_block` shape while still
+/// filling in, so an empty string must not be treated as the final answer,
+/// or a partial frame would win over the completed one. Web results are
+/// similarly taken from the first block that actually carries any.
 fn extract_from_blocks(
     content: &Map<String, Value>,
 ) -> Option<(Option<String>, Vec<SearchWebResult>)> {
     let blocks_value = content.get("blocks")?;
     let blocks: Vec<ResponseBlock> = serde_json::from_value(blocks_value.clone()).ok()?;
+
+    let mut answer: Option<String> = None;
+    let mut web_results: Vec<SearchWebResult> = Vec::new();
+    let mut found_any = false;
+
     for block in blocks {
-        let markdown = match block.markdown_block {
-            Some(markdown) => markdown,
-            None => continue,
-        };
-        if markdown.answer.as_deref().is_some_and(|a| !a.is_empty()) {
-            return Some((markdown.answer, markdown.web_results));
+        if answer.is_none() {
+            if let Some(markdown) = block.markdown_block {
+                if markdown.answer.as_deref().is_some_and(|a| !a.is_empty()) {
+                    answer = markdown.answer;
+                    found_any = true;
+                }
+            }
+        }
+        if web_results.is_empty() {
+            if let Some(web_result_block) = block.web_result_block {
+                if !web_result_block.web_results.is_empty() {
+                    web_results = web_result_block.web_results;
+                    found_any = true;
+                }
+            }
         }
     }
-    None
+
+    if found_any {
+        Some((answer, web_results))
+    } else {
+        None
+    }
 }
 
 /// Deserializes the "text" steps array and pulls answer + web_results from the
@@ -156,6 +192,49 @@ fn extract_string_array(content: &Map<String, Value>, key: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_current_blocks_shape_with_separate_web_results_block() {
+        // Trimmed real shape captured live 2026-09-16 (gap 2764) via a standalone
+        // diagnostic build against the actual Perplexity backend: citations arrive
+        // as a SEPARATE blocks entry (intended_usage: "web_results"), not inside
+        // the ask_text block's markdown_block -- the 2026-08-12 fix's own comment
+        // ("not present on the ask_text block measured above") already flagged
+        // this as unverified, and it was wrong.
+        let json = serde_json::json!({
+            "status": "COMPLETED",
+            "final": true,
+            "blocks": [
+                {
+                    "intended_usage": "ask_text",
+                    "markdown_block": {
+                        "progress": "DONE",
+                        "answer": "Josh Morgan is the mayor of London, Ontario."
+                    }
+                },
+                {
+                    "intended_usage": "web_results",
+                    "web_result_block": {
+                        "progress": "DONE",
+                        "web_results": [
+                            {
+                                "name": "Mayor Josh Morgan - City of London",
+                                "url": "https://london.ca/government/mayor-josh-morgan",
+                                "snippet": "Mayor Josh Morgan took office in 2022."
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let event = parse_sse_event(&json.to_string()).unwrap();
+
+        assert_eq!(event.answer, Some("Josh Morgan is the mayor of London, Ontario.".to_string()));
+        assert_eq!(event.web_results.len(), 1);
+        assert_eq!(event.web_results[0].name, "Mayor Josh Morgan - City of London");
+        assert_eq!(event.web_results[0].url, "https://london.ca/government/mayor-josh-morgan");
+    }
 
     #[test]
     fn test_parse_simple_event() {
